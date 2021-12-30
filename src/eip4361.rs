@@ -7,11 +7,12 @@ use core::{
 use ethers_core::{types::H160, utils::to_checksum};
 use http::uri::{Authority, InvalidUri};
 use iri_string::types::UriString;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 type TimeStamp = DateTime<Utc>;
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub enum Version {
     V1 = 1,
 }
@@ -27,19 +28,103 @@ impl FromStr for Version {
     }
 }
 
-#[derive(Clone)]
+impl fmt::Display for Version {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+mod version_serde {
+    use super::Version;
+    use serde::{de::Error, Deserialize, Deserializer, Serializer};
+    use std::str::FromStr;
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Version, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let string = String::deserialize(deserializer)?;
+        let version = Version::from_str(&string).map_err(Error::custom)?;
+        Ok(version)
+    }
+
+    pub fn serialize<S>(version: &Version, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let version_str = version.to_string();
+        let stripped_cersion = version_str.strip_prefix('V').unwrap_or(&version_str);
+        serializer.serialize_str(stripped_cersion)
+    }
+}
+
+mod authority_serde {
+    use http::uri::Authority;
+    use serde::{de::Error, Deserialize, Deserializer, Serializer};
+    use std::str::FromStr;
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Authority, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let string = String::deserialize(deserializer)?;
+        let authority = http::uri::Authority::from_str(&string).map_err(Error::custom)?;
+        Ok(authority)
+    }
+
+    pub fn serialize<S>(authority: &http::uri::Authority, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&authority.to_string())
+    }
+}
+
+mod hex_serde {
+    use hex::FromHex;
+    use serde::{de::Error, Deserialize, Deserializer, Serializer};
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 20], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let hex_str: &str = Deserialize::deserialize(deserializer)?;
+        let stripped = hex_str.strip_prefix("0x").unwrap_or(hex_str);
+        let buffer = <[u8; 20]>::from_hex(stripped).map_err(Error::custom)?;
+        Ok(buffer)
+    }
+
+    pub fn serialize<S>(hex_buffer: &[u8; 20], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let hex_str = hex::encode(&hex_buffer);
+        let prefixed_hex = format!("0x{}", hex_str);
+        serializer.serialize_str(&prefixed_hex)
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Message {
+    #[serde(with = "authority_serde")]
     pub domain: Authority,
+    #[serde(with = "hex_serde")]
     pub address: [u8; 20],
     pub statement: String,
     pub uri: UriString,
+    #[serde(with = "version_serde")]
     pub version: Version,
     pub chain_id: String,
     pub nonce: String,
     pub issued_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub expiration_time: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub not_before: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub resources: Vec<UriString>,
 }
 
@@ -284,6 +369,7 @@ const RES_TAG: &str = "Resources:";
 #[cfg(test)]
 mod tests {
     use super::*;
+    use assert_json_diff::assert_json_eq;
     use hex::FromHex;
 
     #[test]
@@ -324,6 +410,83 @@ Resources:
 - https://example.com/my-web2-claim.json"#,
         )
         .is_err())
+    }
+
+    #[test]
+    fn siwe_compatible_json_deserialization() {
+        let json = r#"
+        {
+            "domain": "localhost:3000",
+            "address": "0xc766f6de2ff4edf69268f6ef2a7f81934dbb7f62",
+            "chainId": "1",
+            "issuedAt": "2021-12-28T21:43:31.297Z",
+            "uri": "http://localhost:3000",
+            "version": "1",
+            "statement": "Tx submission service",
+            "type": "Personal signature",
+            "nonce": "375222496829012"
+        }
+        "#;
+
+        let raw = "localhost:3000 wants you to sign in with your Ethereum account:\n0xC766F6De2fF4eDf69268f6ef2A7f81934dbB7f62\n\nTx submission service\n\nURI: http://localhost:3000\nVersion: 1\nChain ID: 1\nNonce: 375222496829012\nIssued At: 2021-12-28T21:43:31.297Z";
+
+        let message = serde_json::from_str::<Message>(json).unwrap();
+        assert_eq!(message.to_string(), raw);
+    }
+
+    #[test]
+    fn siwe_compatible_json_serialization() {
+        let json = r#"
+        {
+            "domain": "localhost:3000",
+            "address": "0xc766f6de2ff4edf69268f6ef2a7f81934dbb7f62",
+            "chainId": "1",
+            "issuedAt": "2021-12-28T21:43:31.297Z",
+            "uri": "http://localhost:3000",
+            "version": "1",
+            "statement": "Tx submission service",
+            "nonce": "375222496829012"
+        }
+        "#;
+
+        let raw = "localhost:3000 wants you to sign in with your Ethereum account:\n0xC766F6De2fF4eDf69268f6ef2A7f81934dbB7f62\n\nTx submission service\n\nURI: http://localhost:3000\nVersion: 1\nChain ID: 1\nNonce: 375222496829012\nIssued At: 2021-12-28T21:43:31.297Z";
+
+        let message = Message::from_str(raw).unwrap();
+
+        let reserialized =
+            serde_json::from_str::<serde_json::Value>(&serde_json::to_string(&message).unwrap())
+                .unwrap();
+
+        assert_json_eq!(
+            reserialized,
+            serde_json::from_str::<serde_json::Value>(json).unwrap()
+        );
+    }
+    #[test]
+    fn serialize_deserialize_gives_same_string() {
+        // correct order
+        let message_str = r#"service.org wants you to sign in with your Ethereum account:
+0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2
+
+I accept the ServiceOrg Terms of Service: https://service.org/tos
+
+URI: https://service.org/login
+Version: 1
+Chain ID: 1
+Nonce: 32891756
+Issued At: 2021-09-30T16:25:24Z
+Resources:
+- ipfs://bafybeiemxf5abjwjbikoz4mc3a3dla6ual3jsgpdr4cjr3oz3evfyavhwq/
+- https://example.com/my-web2-claim.json"#;
+
+        let message = Message::from_str(message_str).unwrap();
+        let message_json = serde_json::to_string(&message).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Message>(&message_json)
+                .unwrap()
+                .to_string(),
+            message_str
+        );
     }
 
     #[test]
